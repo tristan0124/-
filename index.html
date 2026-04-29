@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8"> <!-- 日本語の文字化けを防止 [5] -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>QR提出管理 (Chrome対応版)</title>
+    <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 0; padding: 10px; background: #f0f2f5; text-align: center; color: #1c1c1e; }
+        .panel { background: #fff; padding: 15px; border-radius: 12px; margin-bottom: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); display: inline-block; width: 95%; max-width: 450px; }
+        #camera-container { width: 100%; max-width: 400px; margin: auto; border: 3px solid #333; background: #000; border-radius: 12px; overflow: hidden; position: relative; }
+        canvas { width: 100%; display: block; }
+        .controls { margin: 10px 0; display: flex; justify-content: center; flex-wrap: wrap; gap: 6px; }
+        .action-bar { width: 100%; max-width: 400px; margin: 10px auto; display: flex; gap: 6px; }
+        .action-bar button { flex: 1; padding: 12px; font-weight: bold; }
+        input[type="date"], select { padding: 10px; border-radius: 8px; border: 1px solid #ccc; font-size: 14px; background: white; }
+        button { padding: 10px 14px; font-size: 14px; cursor: pointer; border-radius: 10px; border: none; background: #007aff; color: white; transition: 0.2s; }
+        button.active { background: #ff9500; font-weight: bold; transform: scale(1.05); }
+        .summary-btn { background: #34c759; margin-top: 8px; width: 100%; font-weight: bold; font-size: 15px; }
+        #status-list { background: white; border-radius: 12px; padding: 15px; text-align: left; max-width: 450px; margin: 15px auto; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        .student-item { display: flex; justify-content: space-between; padding: 12px; border-bottom: 1px solid #eee; align-items: center; cursor: pointer; border-radius: 8px; }
+        .status-ok { background-color: #e1ffd1; color: #2d5a27; }
+        .status-forget { background-color: #ffe5e5; color: #d00000; }
+        .status-absent { background-color: #f2f2f7; color: #666; }
+        .status-later { background-color: #fff4d1; color: #856404; }
+        .count-badge { background: #007aff; color: white; padding: 2px 10px; border-radius: 12px; font-size: 0.9em; margin-left: 8px; }
+    </style>
+</head>
+<body>
+
+    <div class="panel">
+        <h2>QR提出管理</h2>
+        <strong>記録日の選択:</strong><br>
+        <input type="date" id="date-picker" onchange="changeDate()">
+        <hr style="margin: 12px 0; border: 0; border-top: 1px solid #eee;">
+        <strong>期間・項目別集計CSV:</strong><br>
+        <select id="report-subject"></select><br>
+        <div style="display:flex; justify-content:center; gap:5px; margin-top:5px;">
+            <input type="date" id="start-date"> 〜 <input type="date" id="end-date">
+        </div>
+        <button class="summary-btn" onclick="exportItemPeriodCSV()">期間履歴を書き出す</button>
+    </div>
+
+    <div id="button-area" class="controls"></div>
+    <div id="camera-container"><canvas id="canvas"></canvas></div>
+
+    <div class="action-bar">
+        <button onclick="exportDailyCSV()" style="background: #5856d6;">本日のCSV出力</button>
+        <button onclick="clearData()" style="background: #8e8e93;">データ消去</button>
+    </div>
+
+    <div id="status-list">
+        <div style="font-size: 1.1em; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center;">
+            <div><span id="display-date"></span> / <strong><span id="current-subject-display"></span></strong></div>
+            <span class="count-badge"><span id="count">0</span> / 40名</span>
+        </div>
+        <div id="list-items" style="max-height: 400px; overflow-y: auto;"></div>
+    </div>
+
+    <script>
+        // 日本時間の正確な日付取得 [5]
+        function getLocalDateString() {
+            const now = new Date();
+            return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+        }
+
+        let specialItems = [];
+        if (confirm("特別な提出物はありますか？")) {
+            let count = parseInt(prompt("項目数は？（1〜5）", "1")) || 0;
+            for (let i = 0; i < Math.min(count, 5); i++) {
+                let name = prompt(`${i + 1}つ目の項目名`, `特別${i + 1}`);
+                if (name) specialItems.push(name);
+            }
+        }
+
+        const baseSubjects = ["連絡帳", "算数", "漢字", "音読"];
+        const allSubjects = [...baseSubjects, ...specialItems];
+        const students = Array.from({length: 40}, (_, i) => ({ id: (i + 1).toString().padStart(3, '0'), name: "児童 " + (i + 1) }));
+
+        const todayStr = getLocalDateString();
+        let currentDate = todayStr;
+        let currentSubject = "連絡帳";
+        let submittedData = JSON.parse(localStorage.getItem('qr_v8_chrome_optimized') || '{}');
+
+        function initApp() {
+            document.getElementById('date-picker').value = todayStr;
+            document.getElementById('start-date').value = todayStr;
+            document.getElementById('end-date').value = todayStr;
+            const area = document.getElementById('button-area');
+            const select = document.getElementById('report-subject');
+            allSubjects.forEach(sub => {
+                const btn = document.createElement('button');
+                btn.innerText = sub; btn.id = 'btn-' + sub;
+                btn.onclick = () => setSubject(sub);
+                area.appendChild(btn);
+                const opt = document.createElement('option');
+                opt.value = sub; opt.innerText = sub;
+                select.appendChild(opt);
+            });
+            setSubject("連絡帳");
+        }
+
+        function setSubject(sub) {
+            // Chrome/iOS 音声解除の儀式 [1, 2]
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            currentSubject = sub;
+            allSubjects.forEach(s => document.getElementById('btn-' + s).className = (s === sub ? 'active' : ''));
+            renderList();
+        }
+
+        function changeDate() {
+            currentDate = document.getElementById('date-picker').value;
+            renderList();
+        }
+
+        // タップによるステータス切替 [5]
+        function toggleStatus(id) {
+            const current = submittedData[currentDate][currentSubject][id] || "";
+            let next = "";
+            if (current === "") next = "○";
+            else if (current === "○") next = "忘";
+            else if (current === "忘") next = "欠席";
+            else if (current === "欠席") next = "事後";
+            else next = "";
+
+            if (next === "") delete submittedData[currentDate][currentSubject][id];
+            else submittedData[currentDate][currentSubject][id] = next;
+            renderList();
+        }
+
+        function renderList() {
+            const listItems = document.getElementById('list-items');
+            document.getElementById('display-date').innerText = currentDate;
+            document.getElementById('current-subject-display').innerText = currentSubject;
+            listItems.innerHTML = '';
+            
+            if (!submittedData[currentDate]) submittedData[currentDate] = {};
+            allSubjects.forEach(sub => { if (!submittedData[currentDate][sub]) submittedData[currentDate][sub] = {}; });
+
+            let count = 0;
+            students.forEach(s => {
+                const status = submittedData[currentDate][currentSubject][s.id] || "";
+                if (status === "○") count++;
+                const div = document.createElement('div');
+                div.className = `student-item status-${status === "○" ? "ok" : status === "忘" ? "forget" : status === "欠席" ? "absent" : status === "事後" ? "later" : ""}`;
+                div.onclick = () => toggleStatus(s.id);
+                div.innerHTML = `<span>${s.id}: ${s.name}</span><span style="font-weight:bold">${status === "○" ? "✅" : status}</span>`;
+                listItems.appendChild(div);
+            });
+            document.getElementById('count').innerText = count;
+            localStorage.setItem('qr_v8_chrome_optimized', JSON.stringify(submittedData));
+        }
+
+        // CSV出力 (BOM付き) [2, 4]
+        function downloadCSV(csv, filename) {
+            const blob = new Blob([new Uint8Array([0xEF, 0xBB, 0xBF]), csv], { type: "text/csv;charset=utf-8" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a"); a.href = url; a.download = filename; a.click();
+        }
+
+        function exportDailyCSV() {
+            let csv = "出席番号,氏名," + allSubjects.join(",") + "\n";
+            students.forEach(s => {
+                let row = [s.id, s.name];
+                allSubjects.forEach(sub => row.push((submittedData[currentDate] && submittedData[currentDate][sub] && submittedData[currentDate][sub][s.id]) || ""));
+                csv += row.join(",") + "\n";
+            });
+            downloadCSV(csv, `提出記録_${currentDate}.csv`);
+        }
+
+        function exportItemPeriodCSV() {
+            const targetSub = document.getElementById('report-subject').value;
+            const start = document.getElementById('start-date').value;
+            const end = document.getElementById('end-date').value;
+            if (!start || !end) return alert("期間を入力してください");
+            const datesInRange = Object.keys(submittedData).filter(d => d >= start && d <= end).sort();
+            let csv = `項目：${targetSub}\n出席番号,氏名,${datesInRange.join(",")}\n`;
+            students.forEach(s => {
+                let row = [s.id, s.name];
+                datesInRange.forEach(d => row.push((submittedData[d][targetSub] && submittedData[d][targetSub][s.id]) || ""));
+                csv += row.join(",") + "\n";
+            });
+            downloadCSV(csv, `${targetSub}_期間履歴_${start}_${end}.csv`);
+        }
+
+        // カメラ制御 [1, 2]
+        const video = document.createElement("video");
+        const canvas = document.getElementById("canvas").getContext("2d", { willReadFrequently: true });
+        navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } }).then(s => {
+            video.srcObject = s; video.setAttribute("playsinline", true); video.play();
+            requestAnimationFrame(tick);
+        }).catch(err => alert("カメラの使用を許可してください（HTTPS環境推奨） [1]"));
+
+        function tick() {
+            if (video.readyState === video.HAVE_ENOUGH_DATA) {
+                const cv = document.getElementById("canvas");
+                cv.height = video.videoHeight; cv.width = video.videoWidth;
+                canvas.drawImage(video, 0, 0, cv.width, cv.height);
+                const code = jsQR(canvas.getImageData(0, 0, cv.width, cv.height).data, cv.width, cv.height);
+                if (code) handleScan(code.data);
+            }
+            requestAnimationFrame(tick);
+        }
+
+        let lastScanned = "", scanLock = false;
+        function handleScan(data) {
+            if (scanLock || lastScanned === data) return;
+            const student = students.find(s => s.id === data);
+            if (student) {
+                scanLock = true; lastScanned = data; setTimeout(() => { scanLock = false; lastScanned = ""; }, 2000);
+                if (submittedData[currentDate][currentSubject][data] !== "○") {
+                    submittedData[currentDate][currentSubject][data] = "○";
+                    if (audioCtx) playBeep();
+                    renderList();
+                }
+            }
+        }
+
+        let audioCtx = null;
+        function playBeep() {
+            const osc = audioCtx.createOscillator(); const g = audioCtx.createGain();
+            osc.connect(g); g.connect(audioCtx.destination);
+            osc.frequency.value = 880; g.gain.value = 0.1; osc.start(); osc.stop(audioCtx.currentTime + 0.1);
+        }
+
+        function clearData() { if (confirm("データを消去しますか？")) { submittedData[currentDate][currentSubject] = {}; renderList(); } }
+        initApp();
+    </script>
+</body>
+</html>
